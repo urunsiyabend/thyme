@@ -13,7 +13,7 @@ buildscript {
         classpath("com.android.tools.build:gradle:8.7.3")
         // Cloudstream gradle plugin which makes everything work and builds plugins
         classpath("com.github.recloudstream:gradle:master-SNAPSHOT")
-        classpath("org.jetbrains.kotlin:kotlin-gradle-plugin:2.1.0")
+        classpath("org.jetbrains.kotlin:kotlin-gradle-plugin:2.3.0")
     }
 }
 
@@ -50,6 +50,10 @@ subprojects {
             targetSdk = 35
         }
 
+        testOptions {
+            unitTests.isReturnDefaultValues = true
+        }
+
         compileOptions {
             sourceCompatibility = JavaVersion.VERSION_1_8
             targetCompatibility = JavaVersion.VERSION_1_8
@@ -73,6 +77,7 @@ subprojects {
     dependencies {
         val cloudstream by configurations
         val implementation by configurations
+        val testImplementation by configurations
 
         // Stubs for all Cloudstream classes
         cloudstream("com.lagradost:cloudstream3:pre-release")
@@ -88,6 +93,11 @@ subprojects {
         implementation("org.jetbrains.kotlinx:kotlinx-coroutines-android:1.10.1")      // Kotlin için asenkron işlemler
         implementation("org.jetbrains.kotlinx:kotlinx-serialization-json:1.8.0")
         implementation("com.github.vidstige:jadb:v1.2.1")
+
+        // Test dependencies
+        testImplementation("junit:junit:4.13.2")
+        testImplementation("org.jetbrains.kotlinx:kotlinx-coroutines-test:1.10.1")
+        testImplementation(files(File(System.getProperty("user.home"), ".gradle/caches/cloudstream/cloudstream/cloudstream.jar")))
     }
 }
 

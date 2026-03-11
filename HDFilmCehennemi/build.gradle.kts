@@ -1,4 +1,4 @@
-version = 23
+version = 25
 
 cloudstream {
     authors     = listOf("hexated", "keyiflerolsun")

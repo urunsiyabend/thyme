@@ -43,7 +43,7 @@ import org.jsoup.Jsoup
 import org.jsoup.nodes.Element
 
 class HDFilmCehennemi : MainAPI() {
-    override var mainUrl              = "https://www.hdfilmcehennemi.la"
+    override var mainUrl              = "https://www.hdfilmcehennemi.nl"
     override var name                 = "HDFilmCehennemi"
     override val hasMainPage          = true
     override var lang                 = "tr"
@@ -206,60 +206,129 @@ class HDFilmCehennemi : MainAPI() {
         }
     }
 
-    private fun dcHello(base64Input: String): String {
-        val decodedOnce = base64Decode(base64Input)
-        val reversedString = decodedOnce.reversed()
-        val decodedTwice = base64Decode(reversedString)
-
-        val hdchLink    = if (decodedTwice.contains("+")) {
-        decodedTwice.substringAfterLast("+")
-            } else if (decodedTwice.contains(" ")) {
-        decodedTwice.substringAfterLast(" ")
-            } else if (decodedTwice.contains("|")){
-        decodedTwice.substringAfterLast("|")
-            } else {
-        decodedTwice
+    // New obfuscation decoder: join → reverse → rot13 → base64 → unmix
+    private fun decodeDcFunction(parts: List<String>, key: Long): String {
+        val joined = parts.joinToString("")
+        val reversed = joined.reversed()
+        val rot13 = reversed.map { c ->
+            when (c) {
+                in 'a'..'z' -> ((c - 'a' + 13) % 26 + 'a'.code).toChar()
+                in 'A'..'Z' -> ((c - 'A' + 13) % 26 + 'A'.code).toChar()
+                else -> c
             }
-        Log.d("HDCH", "decodedTwice $decodedTwice")
-             return hdchLink
+        }.joinToString("")
+        val decoded = base64Decode(rot13)
+        val unmixed = StringBuilder()
+        for (i in decoded.indices) {
+            val charCode = decoded[i].code
+            val newCode = ((charCode - (key % (i + 5)).toInt()) + 256) % 256
+            unmixed.append(newCode.toChar())
         }
+        return unmixed.toString()
+    }
 
-    private suspend fun invokeLocalSource(source: String, url: String, subtitleCallback: (SubtitleFile) -> Unit, callback: (ExtractorLink) -> Unit ) {
-        val script    = app.get(url, referer = "${mainUrl}/", interceptor = interceptor).document.select("script").find { it.data().contains("sources:") }?.data() ?: return
-		Log.d("HDCH", "script » $script")
-        val videoData = getAndUnpack(script).substringAfter("file_link=\"").substringBefore("\";")
-		Log.d("HDCH", "videoData » $videoData")
-        val base64Input = videoData.substringAfter("dc_hello(\"").substringBefore("\");")
-        val lastUrl = dcHello(base64Input).substringAfter("https").let { "https$it" }
-        val subData   = script.substringAfter("tracks: [").substringBefore("]")
-		Log.d("HDCH", "subData » $subData")
-        AppUtils.tryParseJson<List<SubSource>>("[${subData}]")?.filter { it.kind == "captions"}?.map {
-            val subtitleUrl = "${mainUrl}${it.file}/"
+    private fun extractVideoUrlFromScript(rawScript: String): String? {
+        // Script may be packed, try to unpack first
+        val script = try {
+            val unpacked = getAndUnpack(rawScript)
+            if (unpacked.length > rawScript.length / 2) unpacked else rawScript
+        } catch (e: Exception) {
+            rawScript
+        }
+        Log.d("HDCH", "extractVideo » unpacked length=${script.length}")
 
-	    val headers = mapOf(
-        "Accept" to "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8,application/signed-exchange;v=b3;q=0.7",
-        "User-Agent" to "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:137.0) Gecko/20100101 Firefox/137.0",
-        "Referer" to "subtitleUrl"
-    )
-    val subtitleResponse = app.get(subtitleUrl, headers = headers, allowRedirects=true, interceptor = interceptor)
-                if (subtitleResponse.isSuccessful) {
+        // Extract the key number from the dc function: (charCode-(KEY%(i+5))+256)%256
+        val keyMatch = Regex("""charCode-\((\d+)%\(i\+(\d+)\)\)""").find(script)
+        Log.d("HDCH", "extractVideo » keyMatch=${keyMatch != null}")
+        val key = keyMatch?.groupValues?.get(1)?.toLongOrNull() ?: return null
+        Log.d("HDCH", "extractVideo » key=$key")
+
+        // Extract the array parts from var s_xxx = dc_xxx([...])
+        val partsMatch = Regex("""var\s+s_\w+\s*=\s*dc_\w+\(\[([^\]]+)\]\)""").find(script)
+        val partsRaw = partsMatch?.groupValues?.get(1) ?: return null
+        val parts = Regex(""""([^"]+)"""").findAll(partsRaw).map { it.groupValues[1] }.toList()
+        Log.d("HDCH", "extractVideo » parts count=${parts.size}")
+
+        if (parts.isEmpty()) return null
+
+        val decoded = decodeDcFunction(parts, key)
+        Log.d("HDCH", "extractVideo » decoded=${decoded.take(200)}")
+        return decoded
+    }
+
+    private suspend fun invokeLocalSource(source: String, url: String, subtitleCallback: (SubtitleFile) -> Unit, callback: (ExtractorLink) -> Unit) {
+        val document = app.get(url, referer = "${mainUrl}/", interceptor = interceptor).document
+        val script = document.select("script").find { it.data().contains("sources:") || it.data().contains("dc_") }?.data() ?: return
+        Log.d("HDCH", "invokeLocal » script length=${script.length}")
+        val scriptOneLine = script.replace("\n", " ").replace("\r", "")
+        Log.d("HDCH", "invokeLocal » script start=${scriptOneLine.take(500)}")
+
+        // Try new dc_xxx obfuscation first
+        val videoUrl = extractVideoUrlFromScript(script)
+        if (videoUrl != null && videoUrl.startsWith("http")) {
+            Log.d("HDCH", "invokeLocal » videoUrl=$videoUrl")
+
+            // Extract subtitles from tracks
+            val subData = script.substringAfter("tracks: [", "").substringBefore("]", "")
+            if (subData.isNotEmpty()) {
+                AppUtils.tryParseJson<List<SubSource>>("[$subData]")?.filter { it.kind == "captions" }?.forEach {
+                    val subtitleUrl = if (it.file?.startsWith("http") == true) it.file else "${mainUrl}${it.file}/"
                     subtitleCallback(SubtitleFile(it.language.toString(), subtitleUrl))
-                    Log.d("HDCH", "Subtitle added: $subtitleUrl")
-                } else {
-                    Log.d("HDCH", "Subtitle URL inaccessible: ${subtitleResponse.code}")
+                    Log.d("HDCH", "invokeLocal » subtitle: ${it.language} $subtitleUrl")
                 }
-        }
-        callback.invoke(
-            newExtractorLink(
-                source  = source,
-                name    = source,
-                url     = lastUrl,
-                type    = ExtractorLinkType.M3U8
-			) {
-                headers = mapOf("Referer" to "${mainUrl}/", "User-Agent" to "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36 Norton/124.0.0.0")
-                quality = Qualities.Unknown.value
             }
-        )
+
+            callback.invoke(
+                newExtractorLink(
+                    source = source,
+                    name   = source,
+                    url    = videoUrl,
+                    type   = ExtractorLinkType.M3U8
+                ) {
+                    headers = mapOf(
+                        "Referer" to "${mainUrl}/",
+                        "User-Agent" to "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/134.0.0.0 Safari/537.36"
+                    )
+                    quality = Qualities.Unknown.value
+                }
+            )
+            return
+        }
+
+        // Fallback: try old file_link method
+        Log.d("HDCH", "invokeLocal » trying old file_link method")
+        try {
+            val unpacked = getAndUnpack(script)
+            val fileLink = unpacked.substringAfter("file_link=\"", "").substringBefore("\";", "")
+            if (fileLink.isNotEmpty()) {
+                val base64Input = fileLink.substringAfter("dc_hello(\"", "").substringBefore("\");", "")
+                if (base64Input.isNotEmpty()) {
+                    val decodedOnce = base64Decode(base64Input)
+                    val reversedString = decodedOnce.reversed()
+                    val decodedTwice = base64Decode(reversedString)
+                    val lastUrl = when {
+                        decodedTwice.contains("+") -> decodedTwice.substringAfterLast("+")
+                        decodedTwice.contains(" ") -> decodedTwice.substringAfterLast(" ")
+                        decodedTwice.contains("|") -> decodedTwice.substringAfterLast("|")
+                        else -> decodedTwice
+                    }.let { if (!it.startsWith("https")) "https$it" else it }
+
+                    callback.invoke(
+                        newExtractorLink(
+                            source = source,
+                            name   = source,
+                            url    = lastUrl,
+                            type   = ExtractorLinkType.M3U8
+                        ) {
+                            headers = mapOf("Referer" to "${mainUrl}/")
+                            quality = Qualities.Unknown.value
+                        }
+                    )
+                }
+            }
+        } catch (e: Exception) {
+            Log.e("HDCH", "invokeLocal » fallback error: ${e.message}")
+        }
     }
 
 override suspend fun loadLinks(
@@ -315,9 +384,10 @@ override suspend fun loadLinks(
         @JsonProperty("meta") val meta: Meta
     )
 
+    @com.fasterxml.jackson.annotation.JsonIgnoreProperties(ignoreUnknown = true)
     data class Meta(
-        @JsonProperty("title") val title: String,
-        @JsonProperty("canonical") val canonical: Boolean,
-        @JsonProperty("keywords") val keywords: Boolean
+        @JsonProperty("title") val title: String? = null,
+        @JsonProperty("canonical") val canonical: Any? = null,
+        @JsonProperty("keywords") val keywords: Any? = null
     )
 }
